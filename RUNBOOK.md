@@ -1,76 +1,140 @@
-# Austin 311 Response-Time Analysis — runbook
+# Runbook
 
-**Thesis.** Austin publishes no response-time targets for most 311 services — but for Transportation & Public Works it does, embedded per-request as a due date. This project uses those as ground truth to validate a constructed-baseline method, then applies that method citywide across 2.5M requests (2014–present), after reconciling a service taxonomy fractured by a decade of department reorganizations.
+Build order, methodology decisions, and the reasoning behind each one.
 
-**Why it's worth more than a dashboard.** It demonstrates four things entry-level analytics portfolios almost never do: it doesn't trust the source (taxonomy reconciliation); it handles right-censoring properly instead of dropping open tickets; it validates a constructed benchmark against real targets where they exist; and it's refreshable — the dataset updates daily and the pipeline re-pulls it.
+## Thesis
 
----
+Austin 311 resolution times can't be compared across years without first
+reconciling a service taxonomy that the city reorganized four times. Once
+reconciled — and once a 180-day auto-close artifact is removed from the baseline —
+the degradation is measurable, rankable, and checkable against the city's own
+scoring.
 
-## The two datasets
+## Datasets
 
-| | Citywide | TPW |
-|---|---|---|
-| Socrata ID | `xwdj-i9he` | `38mr-dwji` |
-| Coverage | All departments, Jan 2014 → present | Transportation & Public Works, Oct 2021 → present |
-| Rows | ~2.54M | ~362k |
-| SLA field | **None** | `overdue_on_date` per request, plus `closed_on_time` / `closed_late` / `of_days_late` |
-| Duplicate flag | No | Yes |
-| Role | Breadth: long-run trend after reconciliation | Rigor: the city's own scoring |
+| Dataset | Socrata ID | Rows | Role |
+|---|---|---|---|
+| Austin 311 Public Data | `i26j-ai4z` | 2,539,128 | Citywide fact table |
+| TPW service requests | `38mr-dwji` | 362,486 | City-set due dates — the independent check |
 
-TPW targets are per type, not flat: parking enforcement ~5 days, traffic signals ~45, right-of-way obstruction ~180. Script 03 query 8 reverse-engineers the full target table.
-
-## What the data actually contains
-
-- **The 2023 spike is the February 2023 ice storm.** Feb 2023 alone: ~63k requests vs a ~20k monthly norm. `ARR - Storm Debris Collection` was the #1 type of 2023 at ~47k after not appearing in 2022's top 15. It's an event, not a system artifact — flagged `is_event_driven`, excluded from the degradation ranking, shown as its own annotated series.
-- **Taxonomy fracture.** Traffic Signal Maintenance (98,659 + 23,925), Loose Dog (79,945 + 30,188), Dead Animal Collection (49,048 + 27,031), Injured/Sick Animal (47,027 + 25,479), Street Light Issue (45,956 + 23,426), Parking Enforcement ATD/TPW (42,161 + 38,538). Code Officer Request has **three** labels — Austin Code, ACD (renamed mid-2023), and DSD (a different department).
-- **Council district** ~61% populated in 2014, ~95%+ from 2015. District cuts start at 2015.
-- **No SLA field citywide.** The 2015–2019 per-service median is the constructed baseline, disclosed as such.
-
----
+The second dataset is what makes the project defensible. It carries a due date on
+every request, which gives 25 services an external standard the constructed
+baseline can be tested against.
 
 ## Build order
 
 | Step | File | Notes |
 |---|---|---|
-| 1 | `sql/01_schema.sql` | DB, schemas, staging + typed tables. Run before ingest. |
-| 2 | `ingest.py` | `pip install requests pyodbc`; needs ODBC Driver 18. `python ingest.py`. ~15 min. |
-| 3 | `sql/02_typed_load.sql` | stg → dw with `TRY_CONVERT`. |
-| 4 | `sql/03_profiling.sql` | Ten queries. Save every output. |
-| 5 | `sql/04_type_reconciliation.sql` | Mapping table. Work the unmapped tail to <2%. |
-| 6 | `sql/05_analysis_views.sql` | Cohort fact, monthly, degradation, TPW views, validation, date dim. |
-| 7 | `dax_measures.md` | Power BI model + measures. |
+| 1 | `sql/01_schema.sql` | Database, `stg` and `dw` schemas, staging as all-NVARCHAR |
+| 2 | `python ingest.py` | Both datasets → staging. `--only` to run one, `--since` for incremental |
+| 3 | `sql/02_typed_load.sql` | stg → dw via `TRY_CONVERT`; bad values become NULL rather than failing the load |
+| 4 | `sql/03_profiling.sql` | Ten queries. Save every output — steps 5 and 6 depend on them |
+| 5 | `sql/04_type_reconciliation.sql` | The 403-row mapping table and the cutover event table. Large; takes about a minute |
+| 6 | `sql/04b_comparability_test.sql` | Median-agreement test. Produces a KEEP / REVIEW / SPLIT verdict per candidate merge |
+| 7 | `sql/04c_apply_verdicts.sql` | Applies the splits, records `mapping_basis` for every row |
+| 8 | `sql/05_analysis_views.sql` | Cohort fact, monthly resolution, degradation, TPW target and validation views, date dimension |
+| 9 | `sql/05b_autoclose_fix.sql` | Auto-close detector; baseline restricted to clean service-years |
+| 10 | `sql/05c_detector_tune.sql` | Detector second pass, plus the Spearman validation summary |
+| 11 | `sql/05d_materialise.sql` | Materialises the detector. Required — see performance note below |
+| 12 | `dax_measures.md` | Power BI model and measures |
 
-Refresh later with `python ingest.py --since YYYY-MM-DD` then re-run 02.
-
-`.gitignore`: `*.pbix`, `*.csv`, `__pycache__/`. Commit SQL, Python, README, screenshots.
+Refresh: `python ingest.py --since YYYY-MM-DD`, then re-run steps 3 and 11.
 
 ---
 
-## Methodology decisions (each one is an interview answer)
+## Methodology decisions
 
-- **Reconciliation rule.** Merge labels only on disjoint date ranges. Overlapping ranges are two departments, not a rename. `mapping_basis` records the reasoning per row.
-- **Right-censoring.** Score only requests created ≥180 days before the latest record; still-open ones count at their days-open-so-far as a lower bound rather than being dropped. The median is identifiable under right-censoring when the censoring time exceeds it, which 180 days does for every service.
-- **Event exclusion.** Storm debris is weather-driven volume; it's out of the ranking and in its own chart.
-- **Impact metric.** `excess_resident_days = recent_n × (recent_median − baseline_median)`. Rank on this, not raw days.
-- **Validation.** Citywide degradation rank vs TPW late-rate rank for the services in both. Agreement within two places is the test.
-- **Duplicates.** TPW flags them; citywide doesn't. TPW's duplicate rate is stated as the likely inflation citywide.
+**Taxonomy reconciliation — comparability test, not date ranges.**
+The first rule was "merge only where date ranges are disjoint; overlapping ranges
+mean two departments, not a rename." It fails in two ways. Retroactive relabelling
+backfills a new label onto old records, producing overlap where a genuine rename
+occurred. And genuinely parallel queues — the Animal Protection twins ran side by
+side 2014–2023 — produce overlap that is *not* a rename. The rule that survived:
+compare the two labels' medians in the years they overlap, merge where they agree,
+split where they don't. Eight labels split on that test. `mapping_basis` records the
+verdict and its evidence per row.
+
+**Right-censoring.**
+Score only requests created at least 180 days before the latest record. Still-open
+requests count at days-open-so-far rather than being dropped — dropping them biases
+fast, because the slowest requests are exactly the ones most likely to still be
+open. The median is identifiable under right-censoring as long as the censoring time
+exceeds it, which 180 days does for every service in the ranking.
+
+**Instant closes excluded.**
+50,038 requests closed in the same second they were created. Those are intake
+artifacts, not resolutions, and they drag every median they touch.
+
+**The 180-day auto-close.**
+Every legacy Public Works service showed a 2015–2019 median of 180–184 days.
+Eleven unrelated services do not independently converge on 180 — that is a timer,
+not a service level. The detector flags a service-year where ≥10% of closes land in
+a 170–190 day band, or where the annual median itself sits between 170 and 200 days.
+Flagged service-years are excluded from the baseline; five services lose their
+baseline entirely and are disclosed rather than dropped silently.
+
+This also corrected an earlier reading. Tree Issue - Right of Way's ~185-day median
+in 2016–2017 looked like a multi-year backlog. It was the timer.
+
+**Event-driven volume excluded from the ranking.**
+Storm debris collection is weather-driven, not a service level. It sits in its own
+chart on the trend page rather than in the degradation ranking.
+
+**Impact metric.**
+`excess_resident_days = recent_n × (recent_median − baseline_median)`
+
+Ranking on median change alone overweights low-volume services. A service that
+slipped two days across 40,000 requests costs residents more than one that slipped
+thirty days across 200.
+
+**Validation.**
+Spearman rank correlation between the constructed degradation rank and TPW's own
+late-rate rank, across the 25 services present in both layers. ρ = 0.42 — the
+methods agree on direction and not on ordering. The stronger evidence is the group
+separation: services flagged degrading average 12.8% late by the city's scoring
+against 5.0% for improving ones.
+
+An earlier version scored "agreement within two rank places," which was the wrong
+test — it treats a ranking disagreement as failure when the two methods measure
+different things.
+
+**Duplicates.**
+TPW flags duplicates; the citywide dataset does not. TPW's ~7% duplicate rate is
+stated as the likely citywide inflation.
+
+---
+
+## Performance note
+
+`vw_autoclose_years` computes a median over ~2M rows per service-year, and three
+downstream views reference it. As a view it recomputes on every reference — the
+validation query ran over four minutes. `05d_materialise.sql` writes it to a table
+(~2,000 rows) with a clustered index and repoints the consumers. Re-run that script
+after every data refresh.
 
 ---
 
 ## Report pages
 
-1. **The finding** — worst service by excess resident-days, ranked bar, one-sentence takeaway.
-2. **Trend** — monthly median + rolling 12M, slicer, Feb 2023 annotated, `Pct Censored` visible.
-3. **Ground truth** — TPW on-time rate by service and month, the reverse-engineered target table, days-late distribution.
-4. **Validation** — degradation rank vs late-rate rank scatter; agreement score; services whose recent median exceeds the city's own target.
-5. **Methodology** — mapping table with `mapping_basis`, coverage %, exclusion rules and counts, district fill rate, open-rate trend, duplicate caveat.
+1. **The Finding** — excess resident-days by service and by department; the
+   resident-day defined on the page.
+2. **Trend** — monthly median and rolling 12-month median for a selected service,
+   auto-close months shaded, the three cutover events marked.
+3. **Ground Truth** — TPW scored by the city's own reverse-engineered due dates;
+   late rate by month and by service, with the target table.
+4. **Validation** — constructed rank vs city late-rate rank, ρ, the group
+   separation, and the labelled disagreement.
+5. **Methodology** — the mapping table with its basis, the cutover timeline, and
+   how each label was classified.
 
 ---
 
-## Resume bullets (fill brackets from real output)
+## Known limitations
 
-> **Austin 311 Service Performance Analysis** | Personal Project — 2026
-> Built a refreshable Python + SQL Server pipeline over 2.9M municipal service requests from two Socrata APIs, reconciling a service taxonomy fractured by department reorganizations ([N] label collisions) that distorted published volume rankings and broke trend lines.
-> Modeled resolution time with right-censoring across a 2015–2019 baseline, validated the method against the city's own per-request due dates for Transportation & Public Works ([X]% rank agreement), and delivered a Power BI report identifying [service] as the largest source of excess resident wait-days ([N]k days/yr).
-
-Replaces the Tableau/NIQ bullet.
+- ρ = 0.42 is moderate. Direction agreement, not order agreement.
+- The median can't see bimodal services. Tree Issue - Right of Way has a one-day
+  median and a 31% late rate. P90 alongside the median is the next iteration.
+- ARR's 2021–22 category rebuild makes pre/post definitions incomparable; those
+  services are excluded from the 2015–2019 baseline.
+- Council-district coverage is incomplete in the citywide dataset, so geographic
+  equity is out of scope here.
