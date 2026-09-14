@@ -1,0 +1,33 @@
+# Power BI
+*.pbix.bak
+*.pbix.tmp
+.pbi/
+
+# Data — never commit extracts
+*.csv
+*.tsv
+*.xlsx
+*.json
+!package.json
+data/
+exports/
+
+# Credentials
+.env
+*.token
+app_token.txt
+config.local.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
