@@ -14,7 +14,7 @@ scoring.
 
 | Dataset | Socrata ID | Rows | Role |
 |---|---|---|---|
-| Austin 311 Public Data | `i26j-ai4z` | 2,539,128 | Citywide fact table |
+| Austin 311 Public Data | `xwdj-i9he` | 2,539,128 | Citywide fact table |
 | TPW service requests | `38mr-dwji` | 362,486 | City-set due dates — the independent check |
 
 The second dataset is what makes the project defensible. It carries a due date on
